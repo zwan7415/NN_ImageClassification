@@ -1,153 +1,193 @@
 #!/usr/bin/env python3
-"""
-    a3main.py
 
-    Neural Networks and Deep Learning
-    DO NOT MODIFY THIS FILE
-"""
 import torch
+import torch.nn as nn
+#import torch.nn.functional as F
+import torch.optim as optim
 import torchvision
-import sklearn.metrics as metrics
-import numpy as np
-import sys
+from torchvision import transforms
 
-from torch.utils.data import Dataset, random_split
-from config import device
+from torchsummary import summary
+import warnings
+warnings.filterwarnings("ignore")
 
-import student
 
-# This class allows train/test split with different transforms
-class DatasetFromSubset(Dataset):
-    def __init__(self, subset, transform=None):
-        self.subset = subset
-        self.transform = transform
-
-    def __getitem__(self, index):
-        x, y = self.subset[index]
-        if self.transform:
-            x = self.transform(x)
-        return x, y
-
-    def __len__(self):
-        return len(self.subset)
-
-# Test network on validation set, if it exists.
-def test_network(net,testloader,print_confusion=False):
-    net.eval()
-    total_images = 0
-    total_correct = 0
-    conf_matrix = np.zeros((8,8))
-    with torch.no_grad():
-        for data in testloader:
-            images, labels = data
-            images = images.to(device)
-            labels = labels.to(device)
-            outputs = net(images)
-            _, predicted = torch.max(outputs.data, 1)
-            total_images += labels.size(0)
-            total_correct += (predicted == labels).sum().item()
-            conf_matrix = conf_matrix + metrics.confusion_matrix(
-                labels.cpu(),predicted.cpu(),labels=[0,1,2,3,4,5,6,7])
-
-    model_accuracy = total_correct / total_images * 100
-    print(', {0} test {1:.2f}%'.format(total_images,model_accuracy))
-    if print_confusion:
-        np.set_printoptions(precision=2, suppress=True)
-        print(conf_matrix)
-    net.train()
-
-def main():
-    print("Using device: {}"
-          "\n".format(str(device)))
-    ########################################################################
-    #######                      Loading Data                        #######
-    ########################################################################
-    data = torchvision.datasets.ImageFolder(root=student.dataset)
+"""
+The architecture of the entire network is a simple convolutional neural network (CNN).
+•	4 convolution layers, in each convolution layer has kernel size 3, stride 1, 
+    padding 1. The first convolution layer has 16 kernels connected to the 
+    input layer, flowing by 32,64 and 128 kernels,image input size 80*80.
     
-    if student.train_val_split == 1:
-        # Train on the entire dataset
-        data = torchvision.datasets.ImageFolder(root=student.dataset,
-                            transform=student.transform('train'))
-        trainloader = torch.utils.data.DataLoader(data,
-                            batch_size=student.batch_size, shuffle=True);
-    else:
-        # Split the dataset into trainset and testset
-        data = torchvision.datasets.ImageFolder(root=student.dataset)
-        data.len=len(data)
-        train_len = int((student.train_val_split)*data.len)
-        test_len = data.len - train_len
-        train_subset, test_subset = random_split(data, [train_len, test_len])
-        trainset = DatasetFromSubset(
-            train_subset, transform=student.transform('train'))
-        testset = DatasetFromSubset(
-            test_subset, transform=student.transform('test'))
-
-        trainloader = torch.utils.data.DataLoader(trainset,
-                            batch_size=student.batch_size, shuffle=True)
-        testloader = torch.utils.data.DataLoader(testset, 
-                            batch_size=student.batch_size, shuffle=False)
-
-    # Get model, loss criterion and optimizer from student
-    net = student.net.to(device)
-    criterion = student.loss_func
-    optimizer = student.optimizer
-    # get weight initialization and lr scheduler, if appropriate
-    weights_init = student.weights_init
-    scheduler = student.scheduler
-
-    # apply custom weight initialization, if it exists
-    net.apply(weights_init)
+•	The maximum pooling layers act to reduce the output dimension, 
+    4 maximum pooling layers are applied after each convolution layer with 
+    setting kernel 2, stride 2, hence the input size will reduce to half. 
     
-    ########################################################################
-    #######                        Training                          #######
-    ########################################################################
-    print("Start training...")
-    for epoch in range(1,student.epochs+1):
-        total_loss = 0
-        total_images = 0
-        total_correct = 0
+•	The normalization layer and ReLu (Rectified Linear Unit) activation function were 
+    inserted between convolution layers and maximum pooling layers.
+    
+    The dropout layer at the beginning of the full connection layer with 
+    dropout out rate 0.5, followed by 2 hidden layers with 64,32 neurons 
+    and the 8 neurons output layer. The Relu activation function used for 
+    each hidden layer, but sigmoid used for the output layer, the output layer 
+    has 8 features.                                                   
+"""
 
-        for batch in trainloader:           # Load batch
-            images, labels = batch 
-            images = images.to(device)
-            labels = labels.to(device)
+############################################################################
+######     Specify transform(s) to be applied to the input images     ######
+############################################################################
+#add reansforms, more data for training
+transforms_train = transforms.Compose([
+    #add augmentations, used to increase data
+    transforms.RandomRotation(degrees=20),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomVerticalFlip(p=0.05),
+    transforms.RandomGrayscale(p=0.2),
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+    #ToTensor change grey scale to [0,1]
+    transforms.ToTensor(),
+    #normalize change grey scale from [0.1] to [-1,1]
+    #add ImageNet mean and std
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
-            preds = net(images)             # Process batch
-            
-            loss = criterion(preds, labels) # Calculate loss
+transforms_test = transforms.Compose([
+    transforms.ToTensor(),
+    #normalize change grey scale from [0.1] to [-1,1]
+    #add ImageNet mean and std
+    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+])
 
-            optimizer.zero_grad()
-            loss.backward()                 # Calculate gradients
-            optimizer.step()                # Update weights
+def transform(mode):
+    """
+    Called when loading the data. Visit this URL for more information:
+    https://pytorch.org/vision/stable/transforms.html
+    You may specify different transforms for training and testing
+    """
+    if mode == 'train':
+        return transforms_train
+    elif mode == 'test':
+        return transforms_test
 
-            output = preds.argmax(dim=1)
 
-            total_loss += loss.item()
-            total_images += labels.size(0)
-            total_correct += output.eq(labels).sum().item()
+############################################################################
+######   Define the Module to process the images and produce labels   ######
+############################################################################
 
-        # apply lr schedule, if it exists
-        if scheduler is not None:
-            scheduler.step()
-            
-        model_accuracy = total_correct / total_images * 100
-        print('ep {0}, loss: {1:.2f}, {2} train {3:.2f}%'.format(
-               epoch, total_loss, total_images, model_accuracy), end='')
+class Network(nn.Module):
+    def __init__(self):
+        super(Network, self).__init__()
+        #4 convolution layers, maximum pooling layers,normalization layer and ReLu
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=16,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+        self.nor1 = nn.BatchNorm2d(16)
 
-        if student.train_val_split < 1:
-            test_network(net,testloader,
-                         print_confusion=(epoch % 10 == 0))
-        else:
-            print()
+        self.conv2 = nn.Conv2d(in_channels=16, out_channels=32,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+        self.nor2 = nn.BatchNorm2d(32)
 
-        if epoch % 10 == 0:
-            torch.save(net.state_dict(),'checkModel.pth')
-            print("   Model saved to checkModel.pth")        
+        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64,
+                               kernel_size=(3, 3), stride=(1, 1),
+                               padding=(1, 1), bias=False)
+        self.nor3 = nn.BatchNorm2d(64)
 
-        sys.stdout.flush()
+        self.conv4 = nn.Conv2d(in_channels=64, out_channels=128,
+                               kernel_size=(3,3), stride=(1,1),
+                               padding=(1, 1), bias=False)
+        self.nor4 = nn.BatchNorm2d(128)
 
-    torch.save(net.state_dict(),'savedModel.pth')
-    print("   Model saved to savedModel.pth")
+        self.Relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        #dropout layer, full connection layers, sigmoid,input value 128*5*%
+        self.dropout = nn.Dropout(p=0.5)
+        self.fc1 = nn.Linear(in_features=128*5*5, out_features=64)
+        # Reference code (Blair, 2023)
+        self.fc2 = nn.Linear(in_features=64, out_features=32)
+        #8 classes cats as output
+        self.fc3 = nn.Linear(in_features=32, out_features=8)
+        self.sigmoid = nn.Sigmoid()
         
-if __name__ == '__main__':
-    main()
+    def forward(self, x):
+        #convolution layers
+        x = self.conv1(x)
+        x = self.nor1(x)
+        x = self.Relu(x)
+        x = self.pool(x)
+
+        x = self.conv2(x)
+        x = self.nor2(x)
+        x = self.Relu(x)
+        x = self.pool(x)
+
+        x = self.conv3(x)
+        x = self.nor3(x)
+        x = self.Relu(x)
+        x = self.pool(x)
+
+        x = self.conv4(x)
+        x = self.nor4(x)
+        x = self.Relu(x)
+        x = self.pool(x)
+
+        #compress images & dropout
+        x = x.view(x.size(0), -1)
+        x = self.dropout(x)
+        #full connection layers & output
+        x = self.fc1(x)
+        x = self.Relu(x)
+        x = self.fc2(x)
+        x = self.Relu(x)
+        x = self.fc3(x)
+        out = self.sigmoid(x)
+        return out
+# name Network()
+net = Network()
+
+#summary network
+summary(net, input_size=(3, 80, 80))
+
+############################################################################
+######      Specify the optimizer and loss function                   ######
+############################################################################
+#Define optimizer SGD and loss function
+# code reference (Blair, 2023)
+optimizer = optim.SGD(net.parameters(), lr=0.1, momentum=0.8)#0.9
+loss_func = nn.CrossEntropyLoss()
+
+############################################################################
+######  Custom weight initialization and lr scheduling are optional   ######
+############################################################################
+
+# Normally, the default weight initialization and fixed learing rate
+# should work fine. But, we have made it possible for you to define
+# your own custom weight initialization and lr scheduler, if you wish.
+
+#weights_init not use
+def weights_init(m):
+    return
+
+#Define scheduler
+# code reference (Blair, 2023)
+scheduler = None
+#scheduler = optim.lr_scheduler.StepLR(optimizer,step_size = 10, gamma = 0.8)
+
+############################################################################
+#######              Metaparameters and training options              ######
+############################################################################
+dataset = "./data"
+#train split changed form 0.8 to 1.0
+train_val_split = 1.0 #0.8
+batch_size = 200
+#epochs changed from 10 to 650,~60sec each epoch with CPU
+#accuracy reached 60% at 42 epoch, reached 70% at 97 epoch,
+#reached 80% at 225 epoch, reached 88-89% at 630 epoch
+epochs = 700 #300
+
+# code reference
+#Blair, A. (2023). Lecture note Week 3 Neural Networks, Deep Learning:
+# Topic 3b: Image Processing: Coding Exercise: Image Classification
+# [Online] University of New South Wales Neural Networks, Deep Learning
+# Available at https://edstem.org/au/courses/11808/lessons/34323/slides/240564/solution
+# [Accessed: 15 June.2023]
